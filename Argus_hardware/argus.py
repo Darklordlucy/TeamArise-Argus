@@ -43,7 +43,9 @@ LOG_DIR, LOG_FILE = "/var/log/argus", "crash_only.log"
 CONFIG_FILE       = "/home/argus/argus_config.json"
 GPS_CACHE_FILE    = "/home/argus/gps_last_position.json"  # Persists GPS across reboots
 
+API_BASE_URL = "https://"
 DEVICE_ID    = "argus-v6"
+ENABLE_API_POSTS = True  # Set to False to disable API posting
 
 HOTSPOT_SSID     = "ARGUS-Config"
 HOTSPOT_PASSWORD = "argus1234"
@@ -1034,3 +1036,123 @@ def _config_mode(buzzer):
     server.stop()
     HotspotManager.disable()
     log.info("=== EXITING CONFIG MODE ===")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  API REPORTING (USING REQUESTS)
+#  Only for crashes and potholes are posted to API
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _post_crash_to_api(lat, lon, sms_sent):
+    """Post crash data to API using requests library"""
+    if not ENABLE_API_POSTS:
+        log.info("API posts disabled (ENABLE_API_POSTS=False)")
+        return
+    
+    try:
+        payload = {
+            "device_id": DEVICE_ID,
+            "lat": lat,
+            "lng": lon,
+            "sms_sent": sms_sent
+        }
+        
+        url = f"{API_BASE_URL}/crashes"
+        log.info(f"Posting crash to API via WiFi: {url}")
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15
+        )
+        
+        if response.status_code in [200, 201]:
+            log.info(f"✓ Crash posted to API (status {response.status_code})")
+        else:
+            log.warning(f"API crash post failed: status {response.status_code}, response: {response.text}")
+        
+    except requests.exceptions.ConnectionError as e:
+        log.error(f"Failed to post crash to API - no internet connection: {e}")
+    except requests.exceptions.Timeout as e:
+        log.error(f"Failed to post crash to API - timeout: {e}")
+    except Exception as e:
+        log.error(f"Failed to post crash to API: {e}")
+
+def _post_hazard_to_api(lat, lon, hazard_class, confidence=None, position_stale=False):
+    """Post hazard data to API using requests library"""
+    if not ENABLE_API_POSTS:
+        log.info("API posts disabled (ENABLE_API_POSTS=False)")
+        return
+    
+    try:
+        payload = {
+            "device_id": DEVICE_ID,
+            "lat": lat,
+            "lng": lon,
+            "hazard_class": hazard_class,
+            "confidence": confidence,
+            "source": "device",
+            "position_stale": position_stale,
+        }
+        
+        url = f"{API_BASE_URL}/hazards"
+        log.info(f"Posting hazard to API : {url}")
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15
+        )
+        
+        if response.status_code in [200, 201]:
+            log.info(f"✓ Hazard '{hazard_class}' posted to API (status {response.status_code})")
+        else:
+            log.warning(f"API hazard post failed: status {response.status_code}, response: {response.text}")
+        
+    except requests.exceptions.ConnectionError as e:
+        log.error(f"Failed to post hazard to API - no internet connection: {e}")
+    except requests.exceptions.Timeout as e:
+        log.error(f"Failed to post hazard to API - timeout: {e}")
+    except Exception as e:
+        log.error(f"Failed to post hazard to API: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SMS DISPATCH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dispatch_sms(lat, lon, altitude, satellites, valid, is_last_known):
+    config = config_manager.get_config()
+    msg1 = (
+        f"ARGUS EMERGENCY: {config.get('user_name', 'Unknown')}\n"
+        f"Blood: {config.get('user_blood', 'Unknown')}\n"
+        f"Allergy: {config.get('user_conditions', 'None')}\n"
+        f"Med: {config.get('user_meds', 'None')}"
+    )
+    if valid:
+        tag  = " (LAST KNOWN)" if is_last_known else ""
+        msg2 = (
+            f"CRASH LOCATION{tag}:\n"
+            f"Lat: {lat:.6f}\nLon: {lon:.6f}\n"
+            f"Maps: https://www.google.com/maps?q={lat:.6f},{lon:.6f}"
+        )
+    else:
+        msg2 = "CRASH LOCATION:\nGPS Fix not acquired."
+
+    sms_sent = False
+    try:
+        for num in config.get("emergency_numbers", []):
+            for attempt in range(1, SMS_MAX_RETRIES + 1):
+                log.info(f"SMS attempt {attempt} → {num}")
+                if _global_modem.send_sms(num, msg1):
+                    time.sleep(2)
+                    if _global_modem.send_sms(num, msg2):
+                        log.info(f"✓ Both SMS chunks sent to {num}")
+                        sms_sent = True
+                        break
+                time.sleep(SMS_RETRY_DELAY_S)
+    except Exception as e:
+        log.error(f"SMS dispatch fatal: {e}")
+
+    if valid:
+        _post_crash_to_api(lat, lon, sms_sent)
