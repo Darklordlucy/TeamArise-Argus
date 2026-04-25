@@ -57,3 +57,20 @@ BUZZER_PATTERNS = {
     "startup":     [(2500, 100, 100,  2)],
     "cancel":      [( 500, 1000,  0,  1)],
 }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Sample Config Layout
+# ══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_CONFIG = {
+    "user_name":         "Vinay Konanpala",
+    "user_age":          "25",
+    "user_blood":        "B+",
+    "user_vehicle":      "MH17AD2026",
+    "user_conditions":   "None",
+    "user_meds":         "None",
+    "user_contact":      "9370741776",
+    "emergency_numbers": ["+917821094156", "+919370741776"],    
+    #Can be upto 5 Numbers
+}
+
