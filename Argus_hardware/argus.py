@@ -43,3 +43,17 @@ HOTSPOT_PORT     = 8080
 GPS_FIX_WAIT_S        = 120   # max seconds to wait for first fix at startup
 GPS_FIX_LOG_INTERVAL  = 10    # how often to log "still waiting" message
 GPS_DROPOUT_TOLERANCE = 5     # consecutive bad sentences before marking invalid
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUZZER PATTERNS
+# ══════════════════════════════════════════════════════════════════════════════
+
+BUZZER_PATTERNS = {
+    "crash":       [(2000, 200, 200, -1)],
+    "turn":        [(1000, 100,   0,  1)],
+    "bump":        [( 800,  50,   0,  1)],
+    "pothole":     [(1200, 150, 100,  2)],
+    "config_mode": [(1500, 500, 500,  3)],
+    "startup":     [(2500, 100, 100,  2)],
+    "cancel":      [( 500, 1000,  0,  1)],
+}
