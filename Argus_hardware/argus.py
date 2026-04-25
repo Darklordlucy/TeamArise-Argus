@@ -7,6 +7,12 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
+import threading
+import RPi.GPIO as GPIO
+import logging
+import time
+import os
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -73,4 +79,87 @@ DEFAULT_CONFIG = {
     "emergency_numbers": ["+917821094156", "+919370741776"],    
     #Can be upto 5 Numbers
 }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _setup_logging():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log = logging.getLogger("argus_crash")
+    log.setLevel(logging.DEBUG)
+    if not log.handlers:
+        fmt = logging.Formatter(
+            "%(asctime)s %(levelname)-8s %(message)s", "%Y-%m-%dT%H:%M:%S"
+        )
+        fh = logging.handlers.RotatingFileHandler(
+            os.path.join(LOG_DIR, LOG_FILE), maxBytes=5*1024*1024, backupCount=3
+        )
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        log.addHandler(ch)
+    return log
+
+log = _setup_logging()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUZZER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Buzzer:
+    def __init__(self, pin):
+        self.pin = pin
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+        self._pwm = GPIO.PWM(pin, 1000)
+        self._pwm.start(0)
+        self._stop_flag      = threading.Event()
+        self._current_thread = None
+        log.info("Buzzer initialized")
+
+    def play_pattern(self, name):
+        if name in BUZZER_PATTERNS:
+            self.play(BUZZER_PATTERNS[name])
+        else:
+            log.warning(f"Unknown buzzer pattern: {name}")
+
+    def play(self, pattern, duration_s=None):
+        self._stop_flag.clear()
+        def _run():
+            start = time.monotonic()
+            for freq, on, off, rep in pattern:
+                c = 0
+                while not self._stop_flag.is_set():
+                    if duration_s and (time.monotonic() - start) >= duration_s:
+                        break
+                    self._pwm.ChangeFrequency(max(1, freq))
+                    self._pwm.ChangeDutyCycle(50)
+                    time.sleep(on / 1000.0)
+                    self._pwm.ChangeDutyCycle(0)
+                    if off > 0:
+                        time.sleep(off / 1000.0)
+                    c += 1
+                    if rep != -1 and c >= rep:
+                        break
+                if self._stop_flag.is_set():
+                    break
+                if duration_s and (time.monotonic() - start) >= duration_s:
+                    break
+            self._pwm.ChangeDutyCycle(0)
+        self._current_thread = threading.Thread(target=_run, daemon=True)
+        self._current_thread.start()
+
+    def stop(self):
+        self._stop_flag.set()
+        if self._current_thread:
+            self._current_thread.join(timeout=0.5)
+        self._pwm.ChangeDutyCycle(0)
+
+    def cleanup(self):
+        self.stop()
+        self._pwm.stop()
+
 
