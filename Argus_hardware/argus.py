@@ -10,11 +10,14 @@
 import threading
 import RPi.GPIO as GPIO
 import logging
-import subprocess
-import json
 import serial
 import time
 import os
+import subprocess
+import json
+import requests
+from flask import Flask, request, jsonify, render_template_string
+from werkzeug.serving import make_server
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -620,3 +623,414 @@ class HotspotManager:
         except Exception as e:
             log.error(f"Status check failed: {e}")
         return False
+    
+# ══════════════════════════════════════════════════════════════════════════════
+#  WEB CONFIG SERVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARGUS Configuration</title>
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --primary: #e63946;
+            --primary-dark: #c1121f;
+            --surface: #ffffff;
+            --bg: #f1f3f5;
+            --text: #212529;
+            --text-muted: #6c757d;
+            --border: #dee2e6;
+            --radius: 12px;
+            --shadow: 0 4px 24px rgba(0,0,0,0.10);
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            min-height: 100vh;
+            padding: 24px 16px 48px;
+            color: var(--text);
+        }
+        .page-header { text-align: center; margin-bottom: 28px; }
+        .page-header .logo {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 64px; height: 64px;
+            background: var(--primary); border-radius: 18px; margin-bottom: 14px;
+            box-shadow: 0 4px 16px rgba(230,57,70,0.35);
+        }
+        .page-header .logo svg { width: 32px; height: 32px; fill: white; }
+        .page-header h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.5px; }
+        .page-header p  { color: var(--text-muted); font-size: 14px; margin-top: 4px; }
+        .card {
+            background: var(--surface); border-radius: var(--radius);
+            box-shadow: var(--shadow); padding: 24px; margin-bottom: 16px;
+        }
+        .card-title {
+            font-size: 13px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.8px; color: var(--primary); margin-bottom: 18px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .card-title svg { width: 16px; height: 16px; fill: var(--primary); flex-shrink: 0; }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        @media (max-width: 480px) { .form-row { grid-template-columns: 1fr; } }
+        .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+        .form-group:last-child { margin-bottom: 0; }
+        label { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        input[type="text"], input[type="number"], input[type="tel"] {
+            padding: 11px 14px; border: 1.5px solid var(--border); border-radius: 8px;
+            font-size: 15px; color: var(--text); background: #fafafa;
+            transition: border-color 0.2s, box-shadow 0.2s; width: 100%;
+        }
+        input:focus {
+            outline: none; border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(230,57,70,0.12); background: white;
+        }
+        .contact-list { display: flex; flex-direction: column; gap: 10px; }
+        .contact-entry {
+            display: flex; align-items: center; gap: 10px;
+            background: #fafafa; border: 1.5px solid var(--border);
+            border-radius: 8px; padding: 10px 12px; transition: border-color 0.2s;
+        }
+        .contact-entry:focus-within {
+            border-color: var(--primary); box-shadow: 0 0 0 3px rgba(230,57,70,0.10);
+        }
+        .contact-number {
+            width: 24px; height: 24px; background: var(--primary); color: white;
+            border-radius: 50%; font-size: 12px; font-weight: 700;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .contact-entry input {
+            border: none; background: transparent; padding: 0; font-size: 15px; flex: 1; min-width: 0;
+        }
+        .contact-entry input:focus { outline: none; box-shadow: none; }
+        .btn-remove {
+            background: none; border: none; cursor: pointer; color: #adb5bd;
+            padding: 4px; border-radius: 6px; display: flex; align-items: center;
+            transition: color 0.2s, background 0.2s; flex-shrink: 0;
+        }
+        .btn-remove:hover { color: var(--primary); background: rgba(230,57,70,0.08); }
+        .btn-remove svg  { width: 16px; height: 16px; fill: currentColor; }
+        .btn-remove.hidden { visibility: hidden; pointer-events: none; }
+        .btn-add-contact {
+            display: flex; align-items: center; justify-content: center; gap: 8px;
+            width: 100%; padding: 10px; background: none;
+            border: 1.5px dashed var(--border); border-radius: 8px;
+            color: var(--text-muted); font-size: 14px; font-weight: 500;
+            cursor: pointer; margin-top: 10px;
+            transition: border-color 0.2s, color 0.2s, background 0.2s;
+        }
+        .btn-add-contact:hover:not(:disabled) {
+            border-color: var(--primary); color: var(--primary); background: rgba(230,57,70,0.04);
+        }
+        .btn-add-contact:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-add-contact svg { width: 16px; height: 16px; fill: currentColor; }
+        .contact-hint { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+        .btn-save {
+            width: 100%; padding: 15px; background: var(--primary); color: white;
+            border: none; border-radius: var(--radius); font-size: 16px; font-weight: 700;
+            cursor: pointer; letter-spacing: 0.3px;
+            transition: background 0.2s, transform 0.15s, box-shadow 0.2s;
+            box-shadow: 0 4px 14px rgba(230,57,70,0.30); margin-top: 8px;
+        }
+        .btn-save:hover  { background: var(--primary-dark); box-shadow: 0 6px 18px rgba(230,57,70,0.38); }
+        .btn-save:active { transform: scale(0.98); }
+        .toast {
+            position: fixed; bottom: 24px; left: 50%;
+            transform: translateX(-50%) translateY(80px);
+            background: #212529; color: white; padding: 12px 22px;
+            border-radius: 100px; font-size: 14px; font-weight: 500;
+            white-space: nowrap; box-shadow: 0 8px 24px rgba(0,0,0,0.20);
+            transition: transform 0.35s cubic-bezier(.34,1.56,.64,1), opacity 0.3s;
+            opacity: 0; z-index: 999;
+        }
+        .toast.show    { transform: translateX(-50%) translateY(0); opacity: 1; }
+        .toast.success { background: #2b9348; }
+        .toast.error   { background: #c1121f; }
+    </style>
+</head>
+<body>
+
+<div class="page-header">
+    <div class="logo">
+        <svg viewBox="0 0 24 24"><path d="M12 2L2 7v5c0 5.25 4.2 10.05 10 11 5.8-.95 10-5.75 10-11V7L12 2zm-1 13H9V9h2v6zm4 0h-2V9h2v6z"/></svg>
+    </div>
+    <h1>ARGUS</h1>
+    <p>Crash Detection System — Configuration</p>
+</div>
+
+<div class="card">
+    <div class="card-title">
+        <svg viewBox="0 0 24 24"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>
+        Personal Information
+    </div>
+    <div class="form-row">
+        <div class="form-group">
+            <label>Full Name</label>
+            <input type="text" id="user_name" placeholder="e.g. Vinay Konanpala" required>
+        </div>
+        <div class="form-group">
+            <label>Age</label>
+            <input type="number" id="user_age" placeholder="25" required>
+        </div>
+    </div>
+    <div class="form-row">
+        <div class="form-group">
+            <label>Blood Group</label>
+            <input type="text" id="user_blood" placeholder="e.g. B+">
+        </div>
+        <div class="form-group">
+            <label>Vehicle Registration</label>
+            <input type="text" id="user_vehicle" placeholder="e.g. MH17AD2026">
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-title">
+        <svg viewBox="0 0 24 24"><path d="M19 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V5a2 2 0 00-2-2zm-7 14l-5-5 1.41-1.41L12 14.17l7.59-7.59L21 8l-9 9z"/></svg>
+        Medical Information
+    </div>
+    <div class="form-group">
+        <label>Medical Conditions</label>
+        <input type="text" id="user_conditions" placeholder="e.g. Hypertension, Diabetes (or None)">
+    </div>
+    <div class="form-group">
+        <label>Current Medications</label>
+        <input type="text" id="user_meds" placeholder="e.g. Aspirin, Insulin (or None)">
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-title">
+        <svg viewBox="0 0 24 24"><path d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1-9.4 0-17-7.6-17-17 0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.6.1.3 0 .7-.2 1L6.6 10.8z"/></svg>
+        Emergency Contacts
+    </div>
+    <div class="form-group">
+        <label>Primary Contact Number</label>
+        <input type="tel" id="user_contact" placeholder="e.g. 9370741776">
+    </div>
+    <div style="margin-top:18px">
+        <label style="display:block;margin-bottom:10px">Alert Recipients (up to 5)</label>
+        <div class="contact-list" id="contactList"></div>
+        <button type="button" class="btn-add-contact" id="btnAddContact" onclick="addContact('')">
+            <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+            Add another contact
+        </button>
+        <p class="contact-hint">Include country code — e.g. +917821094156</p>
+    </div>
+</div>
+
+<button class="btn-save" onclick="saveConfig()">Save Configuration</button>
+<div class="toast" id="toast"></div>
+
+<script>
+const MAX_CONTACTS = 5;
+
+function renderContacts(numbers) {
+    document.getElementById('contactList').innerHTML = '';
+    (numbers.length ? numbers : ['']).forEach(n => addContact(n, false));
+    updateAddButton();
+}
+
+function addContact(value = '', focus = true) {
+    const list = document.getElementById('contactList');
+    if (list.children.length >= MAX_CONTACTS) return;
+    const idx   = list.children.length + 1;
+    const entry = document.createElement('div');
+    entry.className = 'contact-entry';
+    entry.innerHTML = `
+        <div class="contact-number">${idx}</div>
+        <input type="tel" placeholder="+91XXXXXXXXXX" value="${value}" oninput="renumberContacts()"/>
+        <button type="button" class="btn-remove ${idx === 1 ? 'hidden' : ''}"
+                onclick="removeContact(this)" title="Remove">
+            <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>`;
+    list.appendChild(entry);
+    updateAddButton();
+    if (focus) entry.querySelector('input').focus();
+}
+
+function removeContact(btn) {
+    btn.closest('.contact-entry').remove();
+    renumberContacts();
+    updateAddButton();
+}
+
+function renumberContacts() {
+    document.querySelectorAll('.contact-entry').forEach((el, i) => {
+        el.querySelector('.contact-number').textContent = i + 1;
+        el.querySelector('.btn-remove').classList.toggle('hidden', i === 0);
+    });
+}
+
+function updateAddButton() {
+    document.getElementById('btnAddContact').disabled =
+        document.getElementById('contactList').children.length >= MAX_CONTACTS;
+}
+
+function showToast(msg, type = 'success') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className   = `toast ${type} show`;
+    setTimeout(() => { t.className = 'toast'; }, 3500);
+}
+
+function saveConfig() {
+    const numbers = Array.from(
+        document.querySelectorAll('#contactList input')
+    ).map(i => i.value.trim()).filter(Boolean);
+
+    if (!document.getElementById('user_name').value.trim()) {
+        showToast('Please enter your full name', 'error'); return;
+    }
+    if (numbers.length === 0) {
+        showToast('Add at least one emergency contact', 'error'); return;
+    }
+
+    const cfg = {
+        user_name:         document.getElementById('user_name').value.trim(),
+        user_age:          document.getElementById('user_age').value.trim(),
+        user_blood:        document.getElementById('user_blood').value.trim(),
+        user_vehicle:      document.getElementById('user_vehicle').value.trim(),
+        user_conditions:   document.getElementById('user_conditions').value.trim() || 'None',
+        user_meds:         document.getElementById('user_meds').value.trim()        || 'None',
+        user_contact:      document.getElementById('user_contact').value.trim(),
+        emergency_numbers: numbers,
+    };
+
+    fetch('/api/config', {
+        method:  'POST',
+        headers: {'Content-Type': 'application/json'},
+        body:    JSON.stringify(cfg),
+    })
+    .then(r => r.json())
+    .then(d => {
+        if (d.status === 'success') {
+            showToast('✓ Configuration saved! Closing config mode…', 'success');
+        } else {
+            showToast('Save failed — check logs', 'error');
+        }
+    })
+    .catch(() => showToast('Network error — try again', 'error'));
+}
+
+fetch('/api/config').then(r => r.json()).then(data => {
+    document.getElementById('user_name').value       = data.user_name       || '';
+    document.getElementById('user_age').value        = data.user_age        || '';
+    document.getElementById('user_blood').value      = data.user_blood      || '';
+    document.getElementById('user_vehicle').value    = data.user_vehicle    || '';
+    document.getElementById('user_conditions').value = data.user_conditions || '';
+    document.getElementById('user_meds').value       = data.user_meds       || '';
+    document.getElementById('user_contact').value    = data.user_contact    || '';
+    renderContacts(data.emergency_numbers || []);
+});
+</script>
+</body>
+</html>
+"""
+    
+class ConfigServer:
+    def __init__(self, bind_ip: str = "0.0.0.0", port: int = HOTSPOT_PORT):
+        self.bind_ip      = bind_ip
+        self.port         = port
+        self.app          = Flask(__name__)
+        self.server       = None
+        # Signal fired when user successfully saves config
+        self.config_saved = threading.Event()
+        self._setup_routes()
+
+    def _setup_routes(self):
+        @self.app.route("/")
+        def index():
+            return render_template_string(HTML_TEMPLATE)
+
+        @self.app.route("/api/config", methods=["GET"])
+        def get_config():
+            return jsonify(config_manager.get_config())
+
+        @self.app.route("/api/config", methods=["POST"])
+        def save_config():
+            try:
+                if config_manager.save_config(request.json):
+                    self.config_saved.set()   # ← wake up _config_mode immediately
+                    return jsonify({"status": "success"})
+                return jsonify({"status": "error"}), 500
+            except Exception as e:
+                log.error(f"Config save error: {e}")
+                return jsonify({"status": "error", "message": str(e)}), 500
+
+    def start(self):
+        try:
+            self.server = make_server(self.bind_ip, self.port, self.app, threaded=True)
+            log.info(f"✓ Config server listening on http://{self.bind_ip}:{self.port}")
+            self.server.serve_forever()
+        except OSError as e:
+            if "Address already in use" in str(e):
+                log.error(f"Port {self.port} already in use.")
+            else:
+                log.error(f"ConfigServer OSError: {e}")
+            raise
+        except Exception as e:
+            import traceback
+            log.error(f"ConfigServer unexpected error: {e}\n{traceback.format_exc()}")
+            raise
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            log.info("Config server stopped")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIG MODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _config_mode(buzzer):
+    log.info("=== ENTERING CONFIG MODE ===")
+    buzzer.play_pattern("config_mode")
+    time.sleep(2)
+    buzzer.stop()
+
+    if not HotspotManager.enable():
+        log.error("Failed to start hotspot — aborting config mode")
+        return
+
+    bind_ip = HotspotManager.active_ip or "0.0.0.0"
+    server  = ConfigServer(bind_ip=bind_ip, port=HOTSPOT_PORT)
+
+    server_errors = []
+    def _start_server():
+        try:
+            server.start()
+        except Exception as e:
+            server_errors.append(e)
+            log.error(f"ConfigServer thread crashed: {e}")
+
+    server_thread = threading.Thread(target=_start_server, daemon=True)
+    server_thread.start()
+    time.sleep(3)
+
+    if server_errors or not server_thread.is_alive():
+        log.error("Config server failed to start — aborting config mode")
+        HotspotManager.disable()
+        return
+
+    log.info(f"Config mode active — connect to '{HOTSPOT_SSID}' (pw: {HOTSPOT_PASSWORD})")
+    log.info(f"Then open http://{bind_ip}:{HOTSPOT_PORT} in your browser")
+
+    # Block here until user saves config OR 10-minute timeout
+    saved = server.config_saved.wait(timeout=600)
+    if saved:
+        log.info("✓ Config saved by user — shutting down config mode")
+    else:
+        log.info("Config mode timed out after 10 minutes")
+
+    # Brief pause so browser receives the HTTP response before server dies
+    time.sleep(2)
+
+    server.stop()
+    HotspotManager.disable()
+    log.info("=== EXITING CONFIG MODE ===")
