@@ -10,6 +10,7 @@
 import threading
 import RPi.GPIO as GPIO
 import logging
+import subprocess
 import json
 import serial
 import time
@@ -378,3 +379,244 @@ def _gps_reader(stop_event):
             time.sleep(2)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  WIFI HOTSPOT MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HotspotManager:
+    active_ip: str = ""
+
+    @staticmethod
+    def _run(cmd: list, timeout: int = 10) -> subprocess.CompletedProcess:
+        full = ["sudo"] + cmd if cmd[0] != "sudo" else cmd
+        result = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            log.warning(
+                f"CMD [{' '.join(full)}] => rc={result.returncode} | "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        return result
+
+    @staticmethod
+    def _wait_for_iface_state(iface: str, want: str, retries: int = 20) -> bool:
+        for i in range(retries):
+            try:
+                out = subprocess.check_output(
+                    ["sudo", "nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
+                    text=True, timeout=5,
+                )
+                for line in out.splitlines():
+                    if line.startswith(f"{iface}:"):
+                        state = line.split(":", 1)[1]
+                        log.debug(f"[{i+1}/{retries}] {iface} → {state}")
+                        if want in state:
+                            return True
+            except Exception as e:
+                log.debug(f"State-poll error (attempt {i+1}): {e}")
+            time.sleep(1)
+        return False
+
+    @staticmethod
+    def _get_iface_ip(iface: str) -> str:
+        try:
+            out = subprocess.check_output(
+                ["sudo", "ip", "-4", "addr", "show", iface],
+                text=True, timeout=5,
+            )
+            for token in out.split():
+                if "." in token and "/" in token:
+                    return token.split("/")[0]
+        except Exception:
+            pass
+        return ""
+
+    @classmethod
+    def enable(cls) -> bool:
+        try:
+            log.info("=" * 60)
+            log.info("HotspotManager: starting enable sequence")
+            log.info("=" * 60)
+
+            log.info("Step 1: rfkill unblock wifi")
+            r = cls._run(["rfkill", "unblock", "wifi"], timeout=5)
+            if r.returncode != 0:
+                log.error("rfkill unblock failed — cannot continue")
+                return False
+
+            log.info("Step 2: kill orphaned dnsmasq processes")
+            cls._run(["pkill", "-f", "dnsmasq"], timeout=5)
+            time.sleep(1)
+
+            log.info("Step 3: cycle NetworkManager radio")
+            cls._run(["nmcli", "radio", "wifi", "off"], timeout=5)
+            time.sleep(3)
+            cls._run(["nmcli", "radio", "wifi", "on"], timeout=5)
+            time.sleep(3)
+
+            log.info("Step 4: disconnect from any active WiFi networks")
+            # Get list of active WiFi connections
+            try:
+                active_conns = subprocess.check_output(
+                    ["sudo", "nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"],
+                    text=True, timeout=5
+                ).strip()
+                for line in active_conns.splitlines():
+                    if "wireless" in line or "wifi" in line:
+                        conn_name = line.split(":")[0]
+                        log.info(f"Disconnecting from WiFi network: {conn_name}")
+                        cls._run(["nmcli", "connection", "down", conn_name], timeout=5)
+            except Exception as e:
+                log.debug(f"Error disconnecting WiFi: {e}")
+
+            log.info("Step 5: delete stale connection profiles")
+            cls._run(["nmcli", "connection", "delete", HOTSPOT_CON_NAME], timeout=5)
+            cls._run(["nmcli", "connection", "delete", HOTSPOT_SSID],     timeout=5)
+            time.sleep(1)
+
+            log.info("Step 6: disconnect wlan0")
+            cls._run(["nmcli", "device", "disconnect", HOTSPOT_IFACE], timeout=5)
+            time.sleep(2)
+
+            log.info("Step 7: flush ghost IPs from wlan0")
+            cls._run(["ip", "addr", "flush", "dev", HOTSPOT_IFACE], timeout=5)
+            time.sleep(1)
+
+            log.info("Step 8: waiting for wlan0 → disconnected")
+            if not cls._wait_for_iface_state(HOTSPOT_IFACE, "disconnected", retries=20):
+                log.error("wlan0 never reached 'disconnected' — aborting")
+                return False
+            log.info("wlan0 is ready")
+
+            log.info("Step 9: create and activate hotspot")
+            r = cls._run([
+                "nmcli", "device", "wifi", "hotspot",
+                "ifname",   HOTSPOT_IFACE,
+                "con-name", HOTSPOT_CON_NAME,
+                "ssid",     HOTSPOT_SSID,
+                "password", HOTSPOT_PASSWORD,
+                "band",     "bg",
+                "channel",  "6",
+            ], timeout=30)
+
+            if r.returncode != 0:
+                log.error(f"Hotspot creation failed: {r.stderr.strip()}")
+                return False
+
+            log.info("Step 10: waiting for wlan0 → connected")
+            if not cls._wait_for_iface_state(HOTSPOT_IFACE, "connected", retries=20):
+                log.error("Hotspot never reached 'connected' state — aborting")
+                return False
+
+            log.info("Step 11: disabling IPv6 on wlan0")
+            cls._run(
+                ["sysctl", "-w", f"net.ipv6.conf.{HOTSPOT_IFACE}.disable_ipv6=1"],
+                timeout=5,
+            )
+
+            log.info("Step 12: discovering hotspot gateway IP")
+            discovered_ip = ""
+            for attempt in range(10):
+                time.sleep(1)
+                discovered_ip = cls._get_iface_ip(HOTSPOT_IFACE)
+                if discovered_ip:
+                    log.info(f"Gateway IP confirmed: {discovered_ip} (attempt {attempt+1})")
+                    break
+                log.debug(f"IP not yet assigned (attempt {attempt+1}/10)…")
+
+            if not discovered_ip:
+                log.warning("Could not discover gateway IP — falling back to 0.0.0.0")
+                discovered_ip = "0.0.0.0"
+
+            cls.active_ip = discovered_ip
+
+            log.info("Step 13: confirming NM dnsmasq is running")
+            try:
+                ss_out = subprocess.check_output(
+                    ["sudo", "ss", "-tulpn"], text=True, timeout=5
+                )
+                if "dnsmasq" in ss_out:
+                    log.info("dnsmasq confirmed running — DHCP OK")
+                else:
+                    log.warning(
+                        "dnsmasq NOT detected — clients will not receive IPs.\n"
+                        "Fix: sudo systemctl disable --now dnsmasq && "
+                        "sudo systemctl mask dnsmasq"
+                    )
+            except Exception as e:
+                log.debug(f"dnsmasq check error: {e}")
+
+            log.info("=" * 60)
+            log.info("✓ HOTSPOT ACTIVE")
+            log.info(f"  SSID     : {HOTSPOT_SSID}")
+            log.info(f"  Password : {HOTSPOT_PASSWORD}")
+            log.info(f"  Gateway  : {cls.active_ip}")
+            log.info(f"  Web UI   : http://{cls.active_ip}:{HOTSPOT_PORT}")
+            log.info("=" * 60)
+            return True
+
+        except subprocess.CalledProcessError as e:
+            log.error(f"Subprocess error: {e} | stdout={e.output} | stderr={e.stderr}")
+            return False
+        except PermissionError as e:
+            log.error(f"Permission denied — run with sudo: {e}")
+            return False
+        except Exception as e:
+            import traceback
+            log.error(f"Unexpected error in enable(): {e}\n{traceback.format_exc()}")
+            return False
+
+    @classmethod
+    def disable(cls) -> bool:
+        try:
+            log.info("HotspotManager: disabling hotspot")
+            cls._run(["nmcli", "connection", "down",   HOTSPOT_CON_NAME], timeout=10)
+            time.sleep(1)
+            cls._run(["nmcli", "connection", "delete", HOTSPOT_CON_NAME], timeout=10)
+            time.sleep(1)
+            cls._run(["pkill", "-f", "dnsmasq"], timeout=5)
+            cls._run(["ip", "addr", "flush", "dev", HOTSPOT_IFACE],       timeout=5)
+            cls.active_ip = ""
+            
+            # Reconnect to WiFi after disabling hotspot
+            log.info("Attempting to reconnect to WiFi...")
+            try:
+                # Get list of saved WiFi connections (non-hotspot)
+                saved_conns = subprocess.check_output(
+                    ["sudo", "nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+                    text=True, timeout=5
+                ).strip()
+                
+                for line in saved_conns.splitlines():
+                    if ("wireless" in line or "wifi" in line) and HOTSPOT_CON_NAME not in line:
+                        conn_name = line.split(":")[0]
+                        log.info(f"Reconnecting to WiFi network: {conn_name}")
+                        cls._run(["nmcli", "connection", "up", conn_name], timeout=15)
+                        time.sleep(2)
+                        break
+            except Exception as e:
+                log.warning(f"Could not auto-reconnect to WiFi: {e}")
+            
+            log.info("✓ Hotspot disabled")
+            return True
+        except Exception as e:
+            log.error(f"Error disabling hotspot: {e}")
+            return False
+
+    @classmethod
+    def status(cls) -> bool:
+        try:
+            out = subprocess.check_output(
+                ["sudo", "nmcli", "-t", "-f", "DEVICE,STATE,CONNECTION", "device"],
+                text=True, timeout=5,
+            )
+            for line in out.splitlines():
+                if line.startswith(f"{HOTSPOT_IFACE}:"):
+                    parts = line.split(":")
+                    state = parts[1] if len(parts) > 1 else ""
+                    conn  = parts[2] if len(parts) > 2 else ""
+                    is_up = (state == "connected" and conn == HOTSPOT_CON_NAME)
+                    log.info(f"Hotspot status — state={state} conn={conn} active={is_up}")
+                    return is_up
+        except Exception as e:
+            log.error(f"Status check failed: {e}")
+        return False
