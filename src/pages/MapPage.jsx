@@ -1,18 +1,3 @@
-/**
- * ArgusAI — MapPage.jsx  (3D Upgrade)
- * Drop-in replacement for frontend/src/pages/MapPage.jsx
- *
- * Requirements (add to package.json):
- *   "mapbox-gl": "^3.4.0"
- *   "@mapbox/mapbox-gl-geocoder": "^5.0.3"   (optional)
- *
- * Add to your .env:
- *   REACT_APP_MAPBOX_TOKEN=pk.xxxxxxxx
- *
- * Everything else (routeService, LiveConditionsBar, RouteStatsPanel)
- * remains unchanged — this file is a pure visual upgrade.
- */
-
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";

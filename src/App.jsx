@@ -1,11 +1,25 @@
-import React from 'react';
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import Navbar from './components/Navbar'
+import Home from './pages/Home'
+import Dashboard from './pages/Dashboard'
+import MapPage from './pages/MapPage'
+import PageTransition from './components/PageTransition'
+import RouteFlash from './components/RouteFlash'
 
-const App = () => {
+export default function App() {
   return (
-    <div>
-      <h1>Argus Monitoring Dashboard</h1>
-    </div>
-  );
-};
+    <BrowserRouter>
+      <RouteFlash />
 
-export default App;
+      <Navbar />
+
+      <PageTransition>
+        <Routes>
+          <Route path="/"          element={<Home />} />
+          <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/map"       element={<MapPage />} />
+        </Routes>
+      </PageTransition>
+    </BrowserRouter>
+  )
+}
