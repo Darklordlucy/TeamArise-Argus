@@ -1,0 +1,1 @@
+Argus is an AI intellegent navigation system, which uses real time data fetched from our own number plate IOT sensor installed on motorcycles
