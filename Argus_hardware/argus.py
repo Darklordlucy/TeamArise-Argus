@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                ARGUS — Crash Detection with Web Config                       ║
-║              Team Arise - Final Version for Presentation                     ║
+║                               Team Arise                                     ║
 ║           Features: SMS Alert , HTTPS post , LOGS reporting                  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
