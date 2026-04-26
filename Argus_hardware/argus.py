@@ -1156,3 +1156,163 @@ def _dispatch_sms(lat, lon, altitude, satellites, valid, is_last_known):
 
     if valid:
         _post_crash_to_api(lat, lon, sms_sent)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUZZER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Buzzer:
+    def __init__(self, pin):
+        self.pin = pin
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+        self._pwm = GPIO.PWM(pin, 1000)
+        self._pwm.start(0)
+        self._stop_flag      = threading.Event()
+        self._current_thread = None
+        log.info("Buzzer initialized")
+
+    def play_pattern(self, name):
+        if name in BUZZER_PATTERNS:
+            self.play(BUZZER_PATTERNS[name])
+        else:
+            log.warning(f"Unknown buzzer pattern: {name}")
+
+    def play(self, pattern, duration_s=None):
+        self._stop_flag.clear()
+        def _run():
+            start = time.monotonic()
+            for freq, on, off, rep in pattern:
+                c = 0
+                while not self._stop_flag.is_set():
+                    if duration_s and (time.monotonic() - start) >= duration_s:
+                        break
+                    self._pwm.ChangeFrequency(max(1, freq))
+                    self._pwm.ChangeDutyCycle(50)
+                    time.sleep(on / 1000.0)
+                    self._pwm.ChangeDutyCycle(0)
+                    if off > 0:
+                        time.sleep(off / 1000.0)
+                    c += 1
+                    if rep != -1 and c >= rep:
+                        break
+                if self._stop_flag.is_set():
+                    break
+                if duration_s and (time.monotonic() - start) >= duration_s:
+                    break
+            self._pwm.ChangeDutyCycle(0)
+        self._current_thread = threading.Thread(target=_run, daemon=True)
+        self._current_thread.start()
+
+    def stop(self):
+        self._stop_flag.set()
+        if self._current_thread:
+            self._current_thread.join(timeout=0.5)
+        self._pwm.ChangeDutyCycle(0)
+
+    def cleanup(self):
+        self.stop()
+        self._pwm.stop()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMU / CRASH LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _crash_loop(stop_event, buzzer):
+    try:
+        bus = smbus2.SMBus(MPU_I2C_BUS)
+        bus.write_byte_data(MPU_ADDRESS, 0x6B, 0x00)
+        log.info("MPU6050 initialized successfully")
+    except Exception as e:
+        log.error(f"MPU Init Failed: {e}")
+        return
+
+    prev_ax = prev_ay = prev_az = 0.0
+    last_crash_time = 0
+    last_event_time = {"turn": 0, "bump": 0, "pothole": 0}
+
+    while not stop_event.is_set():
+        t0 = time.monotonic()
+        try:
+            data = bus.read_i2c_block_data(MPU_ADDRESS, 0x3B, 6)
+            raw  = struct.unpack(">hhh", bytes(data))
+            
+            # Direct axis mapping - Y is vertical (gravity axis)
+            # X = forward/backward (horizontal)
+            # Y = up/down (vertical)
+            # Z = left/right (horizontal)
+            ax = raw[0]/16384.0  # Forward/backward
+            ay = raw[1]/16384.0  # Up/down (GRAVITY)
+            az = raw[2]/16384.0  # Left/right
+            
+            # Calculate deltas
+            dax = abs(ax - prev_ax)
+            day = abs(ay - prev_ay)
+            daz = abs(az - prev_az)
+            prev_ax, prev_ay, prev_az = ax, ay, az
+            now = time.monotonic()
+
+	    # CRASH DETECTION (posts to API)
+            # Requires significant movement in all 3 axes
+            if dax > CRASH_THRESH_X and day > CRASH_THRESH_Y and daz > CRASH_THRESH_Z:
+                if (now - last_crash_time) > 60:
+                    lat, lon, alt, sats, valid, is_last = gps.snapshot()
+                    loc_tag = f"{'LAST KNOWN ' if is_last else ''}GPS: {lat:.6f}, {lon:.6f}" if valid else "GPS: unavailable"
+                    log.warning(f"🚨 CRASH DETECTED | ΔX:{dax:.3f} ΔY:{day:.3f} ΔZ:{daz:.3f} | {loc_tag}")
+                    buzzer.play_pattern("crash")
+                    deadline, cancelled = now + CANCEL_WINDOW_S, False
+                    while time.monotonic() < deadline:
+                        if GPIO.input(PIN_BUTTON) == GPIO.LOW:
+                            cancelled = True
+                            break
+                        time.sleep(0.05)
+                    buzzer.stop()
+                    if not cancelled:
+                        log.warning(f"🚨 CRASH CONFIRMED — dispatching emergency alert | {loc_tag}")
+                        threading.Thread(
+                            target=_dispatch_sms,
+                            args=(lat, lon, alt, sats, valid, is_last),
+                            daemon=True,
+                        ).start()
+                    else:
+                        log.info("✓ CRASH CANCELLED BY USER")
+                        buzzer.play_pattern("cancel")
+                        time.sleep(1)
+                        buzzer.stop()
+                    last_crash_time = now
+
+	    # POTHOLE DETECTION (posts to API)
+            # Strong vertical (Y-axis) impulse
+            elif day > POTHOLE_THRESH_Y and (now - last_event_time["pothole"]) > 2:
+                lat, lon, alt, sats, valid, is_last = gps.snapshot()
+                loc_tag = f"{'LAST KNOWN ' if is_last else ''}GPS: {lat:.6f}, {lon:.6f}" if valid else "GPS: unavailable"
+                log.info(f"⚠️  POTHOLE DETECTED | ΔZ:{daz:.3f} | {loc_tag}")
+                buzzer.play_pattern("pothole")
+                last_event_time["pothole"] = now
+                # Post pothole to API
+                threading.Thread(
+                    target=_post_hazard_to_api,
+                    args=(lat, lon, "pothole", 0.8, is_last),
+                    daemon=True,
+                ).start()
+
+	    # BUMP DETECTION (local logging only, NO API post)
+            # Moderate vertical (Y-axis) impulse
+            elif day > BUMP_THRESH_Y and (now - last_event_time["bump"]) > 1:
+                lat, lon, alt, sats, valid, is_last = gps.snapshot()
+                loc_tag = f"{'LAST KNOWN ' if is_last else ''}GPS: {lat:.6f}, {lon:.6f}" if valid else "GPS: unavailable"
+                log.info(f"⚠️  BUMP DETECTED | ΔZ:{daz:.3f} | {loc_tag}")
+                buzzer.play_pattern("bump")
+                last_event_time["bump"] = now
+                # No API post for bumps
+        # TURN DETECTION (local logging only, NO API post)
+        # Horizontal plane movement (X and Z axes)
+            elif dax > TURN_THRESH_X and daz > TURN_THRESH_Z and (now - last_event_time["turn"]) > 2:
+                log.info(f"↪️  TURN DETECTED | ΔX:{dax:.3f} ΔZ:{daz:.3f}")
+                buzzer.play_pattern("turn")
+                last_event_time["turn"] = now
+                # No API post for turns
+
+        except Exception as e:
+            log.debug(f"IMU read error: {e}")
+
+        time.sleep(max(0, (1.0 / IMU_SAMPLE_RATE_HZ) - (time.monotonic() - t0)))
