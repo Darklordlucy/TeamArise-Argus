@@ -386,6 +386,97 @@ def _gps_reader(stop_event):
             log.error(f"GPS connection error: {e}")
             time.sleep(2)
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIM800L WITH POWER MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Sim800L:
+    """
+    SIM800L modem with power management via DTR pin.
+    DTR HIGH = sleep mode, DTR LOW = normal mode
+    """
+    
+    def __init__(self, port, baud, dtr_pin=PIN_SIM_DTR):
+        self._port = port
+        self._baud = baud
+        self._dtr_pin = dtr_pin
+        self._ser = None
+        
+        # Setup DTR pin
+        GPIO.setup(self._dtr_pin, GPIO.OUT, initial=GPIO.HIGH)  # Start in sleep
+        log.info("SIM800L DTR pin configured (sleep mode)")
+    
+    def _wake(self):
+        """Wake up modem from sleep mode"""
+        GPIO.output(self._dtr_pin, GPIO.LOW)
+        time.sleep(0.1)  # Small delay for modem to wake
+        
+        if self._ser is None or not self._ser.is_open:
+            self._ser = serial.Serial(self._port, self._baud, timeout=5)
+            time.sleep(1.0)
+            self._ser.reset_input_buffer()
+            # Basic initialization
+            self._write("AT")
+            self._read(2.0)
+            self._write("ATE0")  # Echo off
+            self._read(2.0)
+
+    def _sleep(self):
+        """Put modem into sleep mode"""
+        if self._ser and self._ser.is_open:
+            try:
+                self._ser.close()
+            except:
+                pass
+        GPIO.output(self._dtr_pin, GPIO.HIGH)
+        time.sleep(0.05)
+
+    def _write(self, cmd):
+        if self._ser and self._ser.is_open:
+            self._ser.write((cmd + "\r\n").encode())
+            self._ser.flush()
+
+    def _read(self, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < deadline:
+            if self._ser and self._ser.is_open:
+                try:
+                    chunk = self._ser.read(self._ser.in_waiting or 1)
+                    if chunk:
+                        buf += chunk
+                        if b"OK\r\n" in buf or b"ERROR\r\n" in buf or b"> " in buf or b"DOWNLOAD" in buf:
+                            break
+                except:
+                    break
+            time.sleep(0.02)
+        return buf.decode("utf-8", errors="ignore")
+
+    def send_sms(self, number, body):
+        """Send SMS and return to sleep after"""
+        with _sim800l_lock:
+            try:
+                self._wake()
+                
+                # Set SMS text mode
+                self._write("AT+CMGF=1")
+                self._read(2.0)
+                
+                self._ser.reset_input_buffer()
+                self._write(f'AT+CMGS="{number}"')
+                if ">" not in self._read(5.0):
+                    return False
+                
+                self._ser.write((body + "\x1a").encode())
+                self._ser.flush()
+                resp = self._read(20.0)
+                success = "+CMGS:" in resp or "OK" in resp
+                
+                return success
+            finally:
+                self._sleep()
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  WIFI HOTSPOT MANAGER
