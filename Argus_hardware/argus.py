@@ -18,6 +18,8 @@ import json
 import requests
 from flask import Flask, request, jsonify, render_template_string
 from werkzeug.serving import make_server
+import smbus2
+import struct
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
