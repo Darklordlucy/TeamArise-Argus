@@ -20,6 +20,7 @@ from flask import Flask, request, jsonify, render_template_string
 from werkzeug.serving import make_server
 import smbus2
 import struct
+import signal
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -1318,3 +1319,87 @@ def _crash_loop(stop_event, buzzer):
             log.debug(f"IMU read error: {e}")
 
         time.sleep(max(0, (1.0 / IMU_SAMPLE_RATE_HZ) - (time.monotonic() - t0)))
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    global _global_modem
+    
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(PIN_BUTTON, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    # Initialize global SIM800L modem
+    _global_modem = Sim800L(SIM_PORT, SIM_BAUD, PIN_SIM_DTR)
+    log.info("SIM800L initialized with power management")
+
+    buzzer = Buzzer(PIN_BUZZER)
+    buzzer.play_pattern("startup")
+    time.sleep(0.5)
+    buzzer.stop()
+
+    stop_event = threading.Event()
+    signal.signal(signal.SIGINT, lambda s, f: stop_event.set())
+
+    threading.Thread(target=_gps_reader, args=(stop_event,), daemon=True).start()
+    log.info("System starting… hold button 5 s within 30 s to enter config mode")
+    # Start GPS thread early so it warms up during the config-mode window
+    config_mode_triggered = False
+    start_time = time.monotonic()
+
+    while (time.monotonic() - start_time) < 30:
+        if GPIO.input(PIN_BUTTON) == GPIO.LOW:
+            press_start = time.monotonic()
+            while GPIO.input(PIN_BUTTON) == GPIO.LOW:
+                if (time.monotonic() - press_start) >= 5.0:
+                    log.info("Config mode button trigger detected!")
+                    config_mode_triggered = True
+                    break
+                time.sleep(0.1)
+            if config_mode_triggered:
+                break
+        time.sleep(0.1)
+
+    if config_mode_triggered:
+        _config_mode(buzzer)
+        log.info("Returning to normal mode…")
+        time.sleep(2)
+        config_manager.config = config_manager._load_config()
+
+    # Wait for GPS fix — NEO-6M cold start can take 1-3 min outdoors.
+    # The 30s config window above already counts toward GPS_FIX_WAIT_S.
+    elapsed = time.monotonic() - start_time
+    remaining = max(0, GPS_FIX_WAIT_S - elapsed)
+    if not gps.has_last_fix and remaining > 0:
+        log.info(f"Waiting up to {remaining:.0f}s for GPS fix…")
+        fix_start = time.monotonic()
+        while not gps.has_last_fix and (time.monotonic() - fix_start) < remaining:
+            waited = int(time.monotonic() - fix_start)
+            if waited > 0 and waited % GPS_FIX_LOG_INTERVAL == 0:
+                log.info(f"Still waiting for GPS fix… ({waited}s)")
+            time.sleep(1)
+
+    if not gps.has_last_fix:
+        log.warning("No GPS fix yet — will use position once acquired")
+
+    log.info("=" * 70)
+    log.info("=== NORMAL OPERATION ===")
+    cfg = config_manager.get_config()
+    log.info(f"User      : {cfg['user_name']}")
+    log.info(f"Device ID : {DEVICE_ID}")
+    log.info(f"API Posts : {'ENABLED' if ENABLE_API_POSTS else 'DISABLED'}")
+    log.info(f"Thresholds: X={CRASH_THRESH_X} Y={CRASH_THRESH_Y} Z={CRASH_THRESH_Z}")
+    log.info("=" * 70)
+
+    try:
+        _crash_loop(stop_event, buzzer)
+    finally:
+        buzzer.cleanup()
+        _global_modem.cleanup()
+        GPIO.cleanup()
+        log.info("System stopped cleanly")
+
+if __name__ == "__main__":
+    main()
