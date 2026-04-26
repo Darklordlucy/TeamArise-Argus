@@ -18,6 +18,9 @@ import json
 import requests
 from flask import Flask, request, jsonify, render_template_string
 from werkzeug.serving import make_server
+import smbus2
+import struct
+import signal
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -43,7 +46,9 @@ LOG_DIR, LOG_FILE = "/var/log/argus", "crash_only.log"
 CONFIG_FILE       = "/home/argus/argus_config.json"
 GPS_CACHE_FILE    = "/home/argus/gps_last_position.json"  # Persists GPS across reboots
 
+API_BASE_URL = "https://"
 DEVICE_ID    = "argus-v6"
+ENABLE_API_POSTS = True  # Set to False to disable API posting
 
 HOTSPOT_SSID     = "ARGUS-Config"
 HOTSPOT_PASSWORD = "argus1234"
@@ -380,6 +385,97 @@ def _gps_reader(stop_event):
         except Exception as e:
             log.error(f"GPS connection error: {e}")
             time.sleep(2)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIM800L WITH POWER MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Sim800L:
+    """
+    SIM800L modem with power management via DTR pin.
+    DTR HIGH = sleep mode, DTR LOW = normal mode
+    """
+    
+    def __init__(self, port, baud, dtr_pin=PIN_SIM_DTR):
+        self._port = port
+        self._baud = baud
+        self._dtr_pin = dtr_pin
+        self._ser = None
+        
+        # Setup DTR pin
+        GPIO.setup(self._dtr_pin, GPIO.OUT, initial=GPIO.HIGH)  # Start in sleep
+        log.info("SIM800L DTR pin configured (sleep mode)")
+    
+    def _wake(self):
+        """Wake up modem from sleep mode"""
+        GPIO.output(self._dtr_pin, GPIO.LOW)
+        time.sleep(0.1)  # Small delay for modem to wake
+        
+        if self._ser is None or not self._ser.is_open:
+            self._ser = serial.Serial(self._port, self._baud, timeout=5)
+            time.sleep(1.0)
+            self._ser.reset_input_buffer()
+            # Basic initialization
+            self._write("AT")
+            self._read(2.0)
+            self._write("ATE0")  # Echo off
+            self._read(2.0)
+
+    def _sleep(self):
+        """Put modem into sleep mode"""
+        if self._ser and self._ser.is_open:
+            try:
+                self._ser.close()
+            except:
+                pass
+        GPIO.output(self._dtr_pin, GPIO.HIGH)
+        time.sleep(0.05)
+
+    def _write(self, cmd):
+        if self._ser and self._ser.is_open:
+            self._ser.write((cmd + "\r\n").encode())
+            self._ser.flush()
+
+    def _read(self, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        buf = b""
+        while time.monotonic() < deadline:
+            if self._ser and self._ser.is_open:
+                try:
+                    chunk = self._ser.read(self._ser.in_waiting or 1)
+                    if chunk:
+                        buf += chunk
+                        if b"OK\r\n" in buf or b"ERROR\r\n" in buf or b"> " in buf or b"DOWNLOAD" in buf:
+                            break
+                except:
+                    break
+            time.sleep(0.02)
+        return buf.decode("utf-8", errors="ignore")
+
+    def send_sms(self, number, body):
+        """Send SMS and return to sleep after"""
+        with _sim800l_lock:
+            try:
+                self._wake()
+                
+                # Set SMS text mode
+                self._write("AT+CMGF=1")
+                self._read(2.0)
+                
+                self._ser.reset_input_buffer()
+                self._write(f'AT+CMGS="{number}"')
+                if ">" not in self._read(5.0):
+                    return False
+                
+                self._ser.write((body + "\x1a").encode())
+                self._ser.flush()
+                resp = self._read(20.0)
+                success = "+CMGS:" in resp or "OK" in resp
+                
+                return success
+            finally:
+                self._sleep()
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1034,3 +1130,367 @@ def _config_mode(buzzer):
     server.stop()
     HotspotManager.disable()
     log.info("=== EXITING CONFIG MODE ===")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  API REPORTING (USING REQUESTS)
+#  Only for crashes and potholes are posted to API
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _post_crash_to_api(lat, lon, sms_sent):
+    """Post crash data to API using requests library"""
+    if not ENABLE_API_POSTS:
+        log.info("API posts disabled (ENABLE_API_POSTS=False)")
+        return
+    
+    try:
+        payload = {
+            "device_id": DEVICE_ID,
+            "lat": lat,
+            "lng": lon,
+            "sms_sent": sms_sent
+        }
+        
+        url = f"{API_BASE_URL}/crashes"
+        log.info(f"Posting crash to API via WiFi: {url}")
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15
+        )
+        
+        if response.status_code in [200, 201]:
+            log.info(f"✓ Crash posted to API (status {response.status_code})")
+        else:
+            log.warning(f"API crash post failed: status {response.status_code}, response: {response.text}")
+        
+    except requests.exceptions.ConnectionError as e:
+        log.error(f"Failed to post crash to API - no internet connection: {e}")
+    except requests.exceptions.Timeout as e:
+        log.error(f"Failed to post crash to API - timeout: {e}")
+    except Exception as e:
+        log.error(f"Failed to post crash to API: {e}")
+
+def _post_hazard_to_api(lat, lon, hazard_class, confidence=None, position_stale=False):
+    """Post hazard data to API using requests library"""
+    if not ENABLE_API_POSTS:
+        log.info("API posts disabled (ENABLE_API_POSTS=False)")
+        return
+    
+    try:
+        payload = {
+            "device_id": DEVICE_ID,
+            "lat": lat,
+            "lng": lon,
+            "hazard_class": hazard_class,
+            "confidence": confidence,
+            "source": "device",
+            "position_stale": position_stale,
+        }
+        
+        url = f"{API_BASE_URL}/hazards"
+        log.info(f"Posting hazard to API : {url}")
+        
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=15
+        )
+        
+        if response.status_code in [200, 201]:
+            log.info(f"✓ Hazard '{hazard_class}' posted to API (status {response.status_code})")
+        else:
+            log.warning(f"API hazard post failed: status {response.status_code}, response: {response.text}")
+        
+    except requests.exceptions.ConnectionError as e:
+        log.error(f"Failed to post hazard to API - no internet connection: {e}")
+    except requests.exceptions.Timeout as e:
+        log.error(f"Failed to post hazard to API - timeout: {e}")
+    except Exception as e:
+        log.error(f"Failed to post hazard to API: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SMS DISPATCH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dispatch_sms(lat, lon, altitude, satellites, valid, is_last_known):
+    config = config_manager.get_config()
+    msg1 = (
+        f"ARGUS EMERGENCY: {config.get('user_name', 'Unknown')}\n"
+        f"Blood: {config.get('user_blood', 'Unknown')}\n"
+        f"Allergy: {config.get('user_conditions', 'None')}\n"
+        f"Med: {config.get('user_meds', 'None')}"
+    )
+    if valid:
+        tag  = " (LAST KNOWN)" if is_last_known else ""
+        msg2 = (
+            f"CRASH LOCATION{tag}:\n"
+            f"Lat: {lat:.6f}\nLon: {lon:.6f}\n"
+            f"Maps: https://www.google.com/maps?q={lat:.6f},{lon:.6f}"
+        )
+    else:
+        msg2 = "CRASH LOCATION:\nGPS Fix not acquired."
+
+    sms_sent = False
+    try:
+        for num in config.get("emergency_numbers", []):
+            for attempt in range(1, SMS_MAX_RETRIES + 1):
+                log.info(f"SMS attempt {attempt} → {num}")
+                if _global_modem.send_sms(num, msg1):
+                    time.sleep(2)
+                    if _global_modem.send_sms(num, msg2):
+                        log.info(f"✓ Both SMS chunks sent to {num}")
+                        sms_sent = True
+                        break
+                time.sleep(SMS_RETRY_DELAY_S)
+    except Exception as e:
+        log.error(f"SMS dispatch fatal: {e}")
+
+    if valid:
+        _post_crash_to_api(lat, lon, sms_sent)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUZZER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Buzzer:
+    def __init__(self, pin):
+        self.pin = pin
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+        self._pwm = GPIO.PWM(pin, 1000)
+        self._pwm.start(0)
+        self._stop_flag      = threading.Event()
+        self._current_thread = None
+        log.info("Buzzer initialized")
+
+    def play_pattern(self, name):
+        if name in BUZZER_PATTERNS:
+            self.play(BUZZER_PATTERNS[name])
+        else:
+            log.warning(f"Unknown buzzer pattern: {name}")
+
+    def play(self, pattern, duration_s=None):
+        self._stop_flag.clear()
+        def _run():
+            start = time.monotonic()
+            for freq, on, off, rep in pattern:
+                c = 0
+                while not self._stop_flag.is_set():
+                    if duration_s and (time.monotonic() - start) >= duration_s:
+                        break
+                    self._pwm.ChangeFrequency(max(1, freq))
+                    self._pwm.ChangeDutyCycle(50)
+                    time.sleep(on / 1000.0)
+                    self._pwm.ChangeDutyCycle(0)
+                    if off > 0:
+                        time.sleep(off / 1000.0)
+                    c += 1
+                    if rep != -1 and c >= rep:
+                        break
+                if self._stop_flag.is_set():
+                    break
+                if duration_s and (time.monotonic() - start) >= duration_s:
+                    break
+            self._pwm.ChangeDutyCycle(0)
+        self._current_thread = threading.Thread(target=_run, daemon=True)
+        self._current_thread.start()
+
+    def stop(self):
+        self._stop_flag.set()
+        if self._current_thread:
+            self._current_thread.join(timeout=0.5)
+        self._pwm.ChangeDutyCycle(0)
+
+    def cleanup(self):
+        self.stop()
+        self._pwm.stop()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMU / CRASH LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _crash_loop(stop_event, buzzer):
+    try:
+        bus = smbus2.SMBus(MPU_I2C_BUS)
+        bus.write_byte_data(MPU_ADDRESS, 0x6B, 0x00)
+        log.info("MPU6050 initialized successfully")
+    except Exception as e:
+        log.error(f"MPU Init Failed: {e}")
+        return
+
+    prev_ax = prev_ay = prev_az = 0.0
+    last_crash_time = 0
+    last_event_time = {"turn": 0, "bump": 0, "pothole": 0}
+
+    while not stop_event.is_set():
+        t0 = time.monotonic()
+        try:
+            data = bus.read_i2c_block_data(MPU_ADDRESS, 0x3B, 6)
+            raw  = struct.unpack(">hhh", bytes(data))
+            
+            # Direct axis mapping - Y is vertical (gravity axis)
+            # X = forward/backward (horizontal)
+            # Y = up/down (vertical)
+            # Z = left/right (horizontal)
+            ax = raw[0]/16384.0  # Forward/backward
+            ay = raw[1]/16384.0  # Up/down (GRAVITY)
+            az = raw[2]/16384.0  # Left/right
+            
+            # Calculate deltas
+            dax = abs(ax - prev_ax)
+            day = abs(ay - prev_ay)
+            daz = abs(az - prev_az)
+            prev_ax, prev_ay, prev_az = ax, ay, az
+            now = time.monotonic()
+
+	    # CRASH DETECTION (posts to API)
+            # Requires significant movement in all 3 axes
+            if dax > CRASH_THRESH_X and day > CRASH_THRESH_Y and daz > CRASH_THRESH_Z:
+                if (now - last_crash_time) > 60:
+                    lat, lon, alt, sats, valid, is_last = gps.snapshot()
+                    loc_tag = f"{'LAST KNOWN ' if is_last else ''}GPS: {lat:.6f}, {lon:.6f}" if valid else "GPS: unavailable"
+                    log.warning(f"🚨 CRASH DETECTED | ΔX:{dax:.3f} ΔY:{day:.3f} ΔZ:{daz:.3f} | {loc_tag}")
+                    buzzer.play_pattern("crash")
+                    deadline, cancelled = now + CANCEL_WINDOW_S, False
+                    while time.monotonic() < deadline:
+                        if GPIO.input(PIN_BUTTON) == GPIO.LOW:
+                            cancelled = True
+                            break
+                        time.sleep(0.05)
+                    buzzer.stop()
+                    if not cancelled:
+                        log.warning(f"🚨 CRASH CONFIRMED — dispatching emergency alert | {loc_tag}")
+                        threading.Thread(
+                            target=_dispatch_sms,
+                            args=(lat, lon, alt, sats, valid, is_last),
+                            daemon=True,
+                        ).start()
+                    else:
+                        log.info("✓ CRASH CANCELLED BY USER")
+                        buzzer.play_pattern("cancel")
+                        time.sleep(1)
+                        buzzer.stop()
+                    last_crash_time = now
+
+	    # POTHOLE DETECTION (posts to API)
+            # Strong vertical (Y-axis) impulse
+            elif day > POTHOLE_THRESH_Y and (now - last_event_time["pothole"]) > 2:
+                lat, lon, alt, sats, valid, is_last = gps.snapshot()
+                loc_tag = f"{'LAST KNOWN ' if is_last else ''}GPS: {lat:.6f}, {lon:.6f}" if valid else "GPS: unavailable"
+                log.info(f"⚠️  POTHOLE DETECTED | ΔZ:{daz:.3f} | {loc_tag}")
+                buzzer.play_pattern("pothole")
+                last_event_time["pothole"] = now
+                # Post pothole to API
+                threading.Thread(
+                    target=_post_hazard_to_api,
+                    args=(lat, lon, "pothole", 0.8, is_last),
+                    daemon=True,
+                ).start()
+
+	    # BUMP DETECTION (local logging only, NO API post)
+            # Moderate vertical (Y-axis) impulse
+            elif day > BUMP_THRESH_Y and (now - last_event_time["bump"]) > 1:
+                lat, lon, alt, sats, valid, is_last = gps.snapshot()
+                loc_tag = f"{'LAST KNOWN ' if is_last else ''}GPS: {lat:.6f}, {lon:.6f}" if valid else "GPS: unavailable"
+                log.info(f"⚠️  BUMP DETECTED | ΔZ:{daz:.3f} | {loc_tag}")
+                buzzer.play_pattern("bump")
+                last_event_time["bump"] = now
+                # No API post for bumps
+        # TURN DETECTION (local logging only, NO API post)
+        # Horizontal plane movement (X and Z axes)
+            elif dax > TURN_THRESH_X and daz > TURN_THRESH_Z and (now - last_event_time["turn"]) > 2:
+                log.info(f"↪️  TURN DETECTED | ΔX:{dax:.3f} ΔZ:{daz:.3f}")
+                buzzer.play_pattern("turn")
+                last_event_time["turn"] = now
+                # No API post for turns
+
+        except Exception as e:
+            log.debug(f"IMU read error: {e}")
+
+        time.sleep(max(0, (1.0 / IMU_SAMPLE_RATE_HZ) - (time.monotonic() - t0)))
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    global _global_modem
+    
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(PIN_BUTTON, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    # Initialize global SIM800L modem
+    _global_modem = Sim800L(SIM_PORT, SIM_BAUD, PIN_SIM_DTR)
+    log.info("SIM800L initialized with power management")
+
+    buzzer = Buzzer(PIN_BUZZER)
+    buzzer.play_pattern("startup")
+    time.sleep(0.5)
+    buzzer.stop()
+
+    stop_event = threading.Event()
+    signal.signal(signal.SIGINT, lambda s, f: stop_event.set())
+
+    threading.Thread(target=_gps_reader, args=(stop_event,), daemon=True).start()
+    log.info("System starting… hold button 5 s within 30 s to enter config mode")
+    # Start GPS thread early so it warms up during the config-mode window
+    config_mode_triggered = False
+    start_time = time.monotonic()
+
+    while (time.monotonic() - start_time) < 30:
+        if GPIO.input(PIN_BUTTON) == GPIO.LOW:
+            press_start = time.monotonic()
+            while GPIO.input(PIN_BUTTON) == GPIO.LOW:
+                if (time.monotonic() - press_start) >= 5.0:
+                    log.info("Config mode button trigger detected!")
+                    config_mode_triggered = True
+                    break
+                time.sleep(0.1)
+            if config_mode_triggered:
+                break
+        time.sleep(0.1)
+
+    if config_mode_triggered:
+        _config_mode(buzzer)
+        log.info("Returning to normal mode…")
+        time.sleep(2)
+        config_manager.config = config_manager._load_config()
+
+    # Wait for GPS fix — NEO-6M cold start can take 1-3 min outdoors.
+    # The 30s config window above already counts toward GPS_FIX_WAIT_S.
+    elapsed = time.monotonic() - start_time
+    remaining = max(0, GPS_FIX_WAIT_S - elapsed)
+    if not gps.has_last_fix and remaining > 0:
+        log.info(f"Waiting up to {remaining:.0f}s for GPS fix…")
+        fix_start = time.monotonic()
+        while not gps.has_last_fix and (time.monotonic() - fix_start) < remaining:
+            waited = int(time.monotonic() - fix_start)
+            if waited > 0 and waited % GPS_FIX_LOG_INTERVAL == 0:
+                log.info(f"Still waiting for GPS fix… ({waited}s)")
+            time.sleep(1)
+
+    if not gps.has_last_fix:
+        log.warning("No GPS fix yet — will use position once acquired")
+
+    log.info("=" * 70)
+    log.info("=== NORMAL OPERATION ===")
+    cfg = config_manager.get_config()
+    log.info(f"User      : {cfg['user_name']}")
+    log.info(f"Device ID : {DEVICE_ID}")
+    log.info(f"API Posts : {'ENABLED' if ENABLE_API_POSTS else 'DISABLED'}")
+    log.info(f"Thresholds: X={CRASH_THRESH_X} Y={CRASH_THRESH_Y} Z={CRASH_THRESH_Z}")
+    log.info("=" * 70)
+
+    try:
+        _crash_loop(stop_event, buzzer)
+    finally:
+        buzzer.cleanup()
+        _global_modem.cleanup()
+        GPIO.cleanup()
+        log.info("System stopped cleanly")
+
+if __name__ == "__main__":
+    main()
